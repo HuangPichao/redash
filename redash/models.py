@@ -5,6 +5,7 @@ import functools
 import hashlib
 import itertools
 import logging
+import operator
 import pytz
 import time
 from functools import reduce
@@ -128,7 +129,6 @@ class UserDetail(walrus.Model):
 
     user_id = walrus.IntegerField(index=True)
     updated_at = UTCDateTimeField(index=True, default=utcnow)
-    needs_sync = walrus.BooleanField(index=True, default=True)
 
     @classmethod
     def update(cls, user_id):
@@ -144,38 +144,25 @@ class UserDetail(walrus.Model):
         # or create one if it doesn't exist yet (e.g. when key was purged)
         try:
             user_detail = cls.get(cls.user_id == user_id)
-        except ValueError:
-            user_detail = cls.create(user_id=user_id)
-        # update the timestamp with the current time
-        user_detail.updated_at = utcnow()
-        # mark the user detail ready for syncing
-        user_detail.needs_sync = True
-        # save to Redis
-        user_detail.save()
-        return user_detail
-
-    @classmethod
-    def stop_sync(cls, user_id):
-        """
-        Mark the user detail to not need syncing with Postgres anymore,
-        e.g. when it has just been synced.
-        """
-        try:
-            user_detail = cls.get(cls.user_id == user_id)
-        except ValueError:
-            pass
-        else:
-            user_detail.needs_sync = False
+            # update the timestamp with the current time
+            user_detail.updated_at = utcnow()
+            # save to Redis
             user_detail.save()
+        except ValueError:
+            user_detail = cls.create(
+                user_id=user_id,
+                updated_at=utcnow(),
+            )
+        return user_detail
 
     @classmethod
     def sync(cls, chunksize=1000):
         """
-        Syncs user details to Postges (to the JSONB field User.details).
+        Syncs user details to Postgres (to the JSONB field User.details).
         """
         to_sync = {}
         try:
-            for user_detail in cls.all_to_sync():
+            for user_detail in cls.all():
                 to_sync[user_detail.user_id] = user_detail
 
             user_ids = list(to_sync.keys())
@@ -203,16 +190,16 @@ class UserDetail(walrus.Model):
             # reset list of keys to stop sync
             pass
         finally:
-            for user_id in to_sync:
-                logger.info('Stop syncing user %s', user_id)
-                cls.stop_sync(user_id)
-
-    @classmethod
-    def all_to_sync(cls):
-        """
-        Return all the user details that need to be synced to Postgres.
-        """
-        return cls.query(UserDetail.needs_sync == True)  # noqa
+            user_ids = [str(user_id) for user_id in to_sync.keys()]
+            logger.info(
+                'Deleting temporary user details for users %s',
+                ', '.join(user_ids)
+            )
+            delete_query = [
+                UserDetail.user_id == str(user_id)
+                for user_id in user_ids
+            ]
+            UserDetail.query_delete(reduce(or_, delete_query))
 
 
 class UserDetailsExtension(object):
